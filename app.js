@@ -9,12 +9,44 @@ const chalk = require('chalk');
 const rpcURL = process.env.RPC_URL;
 const privateKey = process.env.PRIVATE_KEY;
 
-const provider = new ethers.providers.JsonRpcProvider(rpcURL);
+// Validate environment variables
+if (!rpcURL || !privateKey) {
+    console.error(chalk.red('Error: RPC_URL or PRIVATE_KEY is not set in .env file'));
+    process.exit(1);
+}
+
+// Define network (updated chainId based on detected network)
+const CALDERA_CHAIN_ID = 33111; // Updated to match detected chainId
+const network = {
+    chainId: CALDERA_CHAIN_ID,
+    name: 'unknown' // Name is unknown for chainId 33111
+};
+
+// Initialize provider with custom network
+const provider = new ethers.providers.JsonRpcProvider(rpcURL, network);
 const wallet = new ethers.Wallet(privateKey, provider);
+
+// Verify network chainId
+async function verifyNetwork() {
+    try {
+        const network = await provider.getNetwork();
+        if (network.chainId !== CALDERA_CHAIN_ID) {
+            console.error(chalk.red(`Error: Connected to wrong network. Expected chainId ${CALDERA_CHAIN_ID}, got ${network.chainId}`));
+            process.exit(1);
+        }
+        console.log(chalk.blue(`Connected to network: ${network.name} (chainId: ${network.chainId})`));
+    } catch (error) {
+        console.error(chalk.red(`Failed to verify network: ${error.message}`));
+        process.exit(1);
+    }
+}
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function main() {
+    // Verify network before proceeding
+    await verifyNetwork();
+
     console.log(chalk.green(` 
 
         ██╗   ██╗██╗   ██╗ ██████╗  █████╗ ██╗      █████╗ ██████╗ ███████╗
@@ -53,41 +85,79 @@ async function sendToken() {
         { name: 'delay', message: 'Delay between transactions (in seconds)?', default: 1 }
     ]);
 
+    // Validate contract address
+    if (!ethers.utils.isAddress(input.contract)) {
+        console.log(chalk.red('Invalid token contract address'));
+        process.exit(1);
+    }
+
     const abi = [
-        "function transfer(address to, uint amount) public returns (bool)"
+        "function transfer(address to, uint amount) public returns (bool)",
+        "function balanceOf(address account) public view returns (uint256)"
     ];
     const token = new ethers.Contract(input.contract, abi, wallet);
 
-    const addresses = fs.readFileSync('addresses.txt', 'utf-8').split('\n').filter(Boolean);
+    // Check wallet balance
+    const balance = await provider.getBalance(wallet.address);
+    console.log(chalk.blue(`Wallet balance: ${ethers.utils.formatEther(balance)} ETH`));
+    if (balance.isZero()) {
+        console.log(chalk.red('Wallet has no ETH for gas. Please fund the wallet.'));
+        process.exit(1);
+    }
 
-    for (let i = addresses.length - 1; i > 0; i--) {
+    // Check token balance
+    const tokenBalance = await token.balanceOf(wallet.address);
+    console.log(chalk.blue(`Token balance: ${ethers.utils.formatUnits(tokenBalance, input.decimals)} ${input.symbol}`));
+
+    // Load and validate addresses
+    const address = fs.readFileSync('address.txt', 'utf-8')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .filter(addr => {
+            if (!ethers.utils.isAddress(addr)) {
+                console.log(chalk.yellow(`Skipping invalid address: ${addr}`));
+                return false;
+            }
+            return true;
+        });
+    if (address.length === 0) {
+        console.log(chalk.red('No valid addresses found in address.txt'));
+        process.exit(1);
+    }
+
+    // Shuffle addresses
+    for (let i = address.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [addresses[i], addresses[j]] = [addresses[j], addresses[i]];
+        [address[i], address[j]] = [address[j], address[i]];
     }
 
     const fluctuationPercentages = [3, 4, 5];
-    
-    for (let i = 0; i < Math.min(input.count, addresses.length); i++) {
+
+    for (let i = 0; i < Math.min(input.count, address.length); i++) {
         const baseAmount = parseFloat(input.amount);
         const fluctuationPercentage = fluctuationPercentages[Math.floor(Math.random() * fluctuationPercentages.length)];
         const fluctuation = (baseAmount * (fluctuationPercentage / 100)) - (baseAmount * (fluctuationPercentage / 200));
         const finalAmount = baseAmount + fluctuation;
         const amountInWei = ethers.utils.parseUnits(finalAmount.toString(), input.decimals);
 
+        console.log(chalk.blue(`Attempting TX ${i + 1} to address: ${address[i]}`));
+
         try {
-            const gasLimit = await token.estimateGas.transfer(addresses[i], amountInWei).catch(() => {
-                console.log(chalk.yellow(`Gas estimation failed for TX ${i + 1}. Setting default gas limit.`));
-                return ethers.BigNumber.from(200000);
+            const gasLimit = await token.estimateGas.transfer(address[i], amountInWei).catch((err) => {
+                console.log(chalk.yellow(`Gas estimation failed for TX ${i + 1}. Error: ${err.message}`));
+                console.log(chalk.yellow(`Setting default gas limit.`));
+                return ethers.BigNumber.from(500000);
             });
 
-            const tx = await token.transfer(addresses[i], amountInWei, { gasLimit: gasLimit });
+            const tx = await token.transfer(address[i], amountInWei, { gasLimit: gasLimit });
             await tx.wait();
 
             console.log(chalk.green(`TX ${i + 1} Successful! ✅ ${finalAmount.toFixed(3)}`));
-            console.log(chalk.blue(`Sending to ${addresses[i]}`));
+            console.log(chalk.blue(`Sending to ${address[i]}`));
             console.log(chalk.green(`[View on Explorer: https://curtis.explorer.caldera.xyz/tx/${tx.hash}]`));
         } catch (error) {
-            console.log(chalk.red(`TX ${i + 1}: Failed to send to ${addresses[i]}. Error: ${error.message}`));
+            console.log(chalk.red(`TX ${i + 1}: Failed to send to ${address[i]}. Error: ${error.message}`));
         }
 
         await delay(input.delay * 1000);
